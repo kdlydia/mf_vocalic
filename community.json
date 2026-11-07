@@ -1,0 +1,8 @@
+{
+  "description": "Records the voice through a buffer pipeline and splits it into vowel and consonant streams on the GPU.",
+  "licence": "GPLv3",
+  "min_version": "1.0.0",
+  "name": "mf_vocalic",
+  "needs_lila": false,
+  "schema_version": 1
+}
