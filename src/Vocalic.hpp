@@ -45,6 +45,7 @@ struct VocalicConfig : OperationConfig {
             FacetMember<&VocalicConfig::voicing> {},
             FacetMember<&VocalicConfig::zcr_max> {},
             FacetMember<&VocalicConfig::vowel_floor> {},
+            FacetMember<&VocalicConfig::reference_rms> {},
             FacetMember<&VocalicConfig::smooth> {},
             FacetMember<&VocalicConfig::fade> {},
             FacetMember<&VocalicConfig::compact> {},
@@ -67,6 +68,9 @@ struct VocalicConfig : OperationConfig {
     float zcr_max { 0.2F };
     /// A vowel frame is at least this fraction of the loudest frame's RMS.
     float vowel_floor { 0.12F };
+    /// Loudness the vowel floor also measures against, for short windows of a
+    /// longer stream. The floor uses whichever is louder, this or the loudest frame.
+    float reference_rms { 0.F };
     /// Frames on each side in the majority vote that cleans the labels.
     uint32_t smooth { 2 };
     /// Frames on each side of a label change that are crossfaded.
@@ -96,7 +100,8 @@ struct Frame {
 
 [[nodiscard]] uint8_t classify(const Frame& f, const Yantra::VocalicConfig& cfg, float vowel_rms);
 
-/// Labels after the majority vote. vowel_rms is vowel_floor times the loudest frame.
+/// Labels after the majority vote. A vowel reaches vowel_floor times the louder of
+/// reference_rms and the loudest frame.
 [[nodiscard]] std::vector<float> labels(std::span<const Frame> frames, const Yantra::VocalicConfig& cfg);
 
 [[nodiscard]] float loudest(std::span<const Frame> frames);

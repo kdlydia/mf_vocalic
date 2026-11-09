@@ -85,7 +85,7 @@ float loudest(std::span<const Frame> frames)
 // Mirrors k_labels_glsl.
 std::vector<float> labels(std::span<const Frame> frames, const Yantra::VocalicConfig& cfg)
 {
-    const float vowel_rms = cfg.vowel_floor * loudest(frames);
+    const float vowel_rms = cfg.vowel_floor * std::max(cfg.reference_rms, loudest(frames));
     const auto n = static_cast<int64_t>(frames.size());
     const auto r = static_cast<int64_t>(cfg.smooth);
 

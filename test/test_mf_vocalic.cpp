@@ -1,4 +1,5 @@
 #include "PipelineRecorder.hpp"
+#include "VocalicGate.hpp"
 #include "VocalicGrammar.hpp"
 #include "VocalicShaders.hpp"
 
@@ -245,6 +246,7 @@ void test_shader_specs()
     namespace G = Portal::Graphics;
     const std::pair<const char*, G::ShaderSpec> specs[] {
         { "vocalic_features", Yantra::VocalicShaders::features() },
+        { "vocalic_reduce", Yantra::VocalicShaders::reduce() },
         { "vocalic_labels", Yantra::VocalicShaders::labels() },
         { "vocalic_split", Yantra::VocalicShaders::split() },
     };
@@ -259,6 +261,88 @@ void test_shader_specs()
     }
 }
 
+// ---- live gate ------------------------------------------------------------------------------------
+
+struct GateRun {
+    std::vector<double> in;
+    std::vector<double> out;
+    uint64_t rerun_written_before = 0;
+    uint64_t rerun_written_after = 0;
+};
+
+GateRun run_gate(Buffers::VocalicGateMode mode)
+{
+    Rig rig;
+    Buffers::VocalicGateConfig cfg;
+    cfg.delay_seconds = 0.1;
+    auto gate = Buffers::VocalicGate::attach(*rig.manager, rig.scheduler, cfg);
+    gate->set_levels(1.0, 1.0);
+    gate->set_mode(mode);
+
+    Speech speech;
+    GateRun run;
+    run.in = speech.x;
+    const size_t blocks = speech.x.size() / k_block;
+    for (size_t b = 0; b < blocks; ++b) {
+        std::vector<double> block(speech.x.begin() + static_cast<std::ptrdiff_t>(b * k_block),
+            speech.x.begin() + static_cast<std::ptrdiff_t>((b + 1) * k_block));
+        rig.manager->process_input(block.data(), 1, k_block);
+        rig.scheduler.process_buffer_cycle_tasks();
+        rig.manager->process_channel(Buffers::ProcessingToken::AUDIO_BACKEND, 0, k_block);
+        if (b == blocks / 2) {
+            // A second run in the same cycle must not take the input again.
+            run.rerun_written_before = gate->samples_in();
+            rig.manager->process_channel(Buffers::ProcessingToken::AUDIO_BACKEND, 0, k_block);
+            run.rerun_written_after = gate->samples_in();
+        }
+        rig.manager->process_channel(Buffers::ProcessingToken::AUDIO_BACKEND, 1, k_block);
+        const auto& out = gate->outputs()[0]->get_data();
+        run.out.insert(run.out.end(), out.begin(), out.end());
+        // The display runs about a third as often as the audio blocks.
+        if (b % 3 == 2) {
+            (void)gate->analyse();
+        }
+    }
+    return run;
+}
+
+/// Output energy over the delayed input energy, for input seconds [a, b).
+double passed(const GateRun& run, double a, double b, double delay)
+{
+    const auto d = static_cast<size_t>(delay * k_rate);
+    double num = 0.0;
+    double den = 0.0;
+    for (auto s = static_cast<size_t>(a * k_rate); s < static_cast<size_t>(b * k_rate); ++s) {
+        if (s + d >= run.out.size()) {
+            break;
+        }
+        num += run.out[s + d] * run.out[s + d];
+        den += run.in[s] * run.in[s];
+    }
+    return den > 0.0 ? num / den : 0.0;
+}
+
+void test_live_gate()
+{
+    // Input: silence to 0.3 s, vowel to 0.7 s, noise to 0.9 s, vowel to 1.3 s, silence to 1.5 s.
+    const auto vowels = run_gate(Buffers::VocalicGateMode::Vowels);
+    const double v_in_vowel = passed(vowels, 0.4, 0.65, 0.1);
+    const double v_in_noise = passed(vowels, 0.75, 0.85, 0.1);
+    std::printf("      vowel mode: %.2f of the vowel passed, %.3f of the noise\n", v_in_vowel, v_in_noise);
+    check(v_in_vowel > 0.9 && v_in_noise < 0.05, "vowel mode lets vowels through and holds back the noise");
+
+    const auto consonants = run_gate(Buffers::VocalicGateMode::Consonants);
+    const double c_in_vowel = passed(consonants, 0.4, 0.65, 0.1);
+    const double c_in_noise = passed(consonants, 0.75, 0.85, 0.1);
+    std::printf("      consonant mode: %.3f of the vowel passed, %.2f of the noise\n", c_in_vowel, c_in_noise);
+    check(c_in_noise > 0.9 && c_in_vowel < 0.05, "consonant mode does the reverse");
+
+    check(vowels.rerun_written_after == vowels.rerun_written_before, "a second run in one cycle takes no new input");
+
+    const auto off = run_gate(Buffers::VocalicGateMode::Off);
+    check(passed(off, 0.3, 1.3, 0.1) == 0.0, "off is silent");
+}
+
 } // namespace
 
 int main()
@@ -268,6 +352,7 @@ int main()
     test_labels_cpu();
     test_grammar_split();
     test_shader_specs();
+    test_live_gate();
 
     std::printf("\n%s (%d failed)\n", failures == 0 ? "all passed" : "FAILED", failures);
     return failures == 0 ? 0 : 1;

@@ -2,8 +2,10 @@
 #include "VocalicShaders.hpp"
 
 #include <MayaFlux/Portal/Graphics/ShaderFoundry.hpp>
+#include <MayaFlux/Yantra/Executors/GpuResourceManager.hpp>
 #include <MayaFlux/Yantra/Executors/ShaderSpecBinding.hpp>
 
+#include <bit>
 #include <cmath>
 
 namespace MayaFlux::Yantra {
@@ -20,14 +22,24 @@ namespace {
         uint32_t chunks;
     };
 
+    struct ReducePush {
+        uint32_t frames;
+        uint32_t chunks;
+    };
+
     struct LabelPush {
         uint32_t frames;
         uint32_t smooth;
         float silence;
         float voicing;
         float zcr_max;
-        float vowel_rms;
+        float vowel_floor;
     };
+
+    std::array<uint32_t, 3> groups_for(size_t invocations)
+    {
+        return { static_cast<uint32_t>((invocations + 255) / 256), 1U, 1U };
+    }
 
     std::vector<double> widen(const std::vector<float>& v)
     {
@@ -79,63 +91,108 @@ bool VocalicAnalyzer::validate_analysis_input(const input_type& input) const
     return !input.data.empty() && !vocalic_samples(input.data[0]).empty();
 }
 
-bool VocalicAnalyzer::run_gpu(std::span<const float> x, const VocalicConfig& cfg,
-    std::vector<Kinesis::Vocalic::Frame>& frames, std::vector<float>& labels)
+bool VocalicAnalyzer::prepare_gpu()
 {
-    // One invocation per sample is dispatched, so frames * chunks must fit: hop >= chunks.
-    if (m_cpu_only || m_gpu_failed || cfg.hop < VocalicShaders::k_lag_chunks) {
+    if (m_chain) {
+        return true;
+    }
+    if (!Portal::Graphics::get_shader_foundry().is_initialized()) {
         return false;
     }
-    if (!m_features) {
-        m_features = vocalic_shader(VocalicShaders::features(), sizeof(FeaturePush), "vocalic_features");
-        m_labels = vocalic_shader(VocalicShaders::labels(), sizeof(LabelPush), "vocalic_labels");
-        if (!m_features || !m_labels) {
-            m_features.reset();
-            m_labels.reset();
+
+    const auto features = VocalicShaders::features();
+    const auto reduce = VocalicShaders::reduce();
+    const auto labels = VocalicShaders::labels();
+    if (features.push_constant_bytes != sizeof(FeaturePush) || reduce.push_constant_bytes != sizeof(ReducePush)
+        || labels.push_constant_bytes != sizeof(LabelPush)) {
+        MF_ERROR(Journal::Component::Yantra, Journal::Context::Runtime,
+            "VocalicAnalyzer: push constant sizes do not match the shader specs");
+        m_gpu_failed = true;
+        return false;
+    }
+
+    m_features_config = config_from_spec(features);
+    m_reduce_config = config_from_spec(reduce);
+    m_labels_config = config_from_spec(labels);
+    for (const auto* config : { &m_features_config, &m_reduce_config, &m_labels_config }) {
+        if (config->shader_id == Portal::Graphics::INVALID_SHADER) {
             return false;
         }
     }
 
+    // Every slot is a shared buffer, so the context only declares where they sit.
+    namespace S = VocalicShaders::Slot;
+    using B = GpuBufferBinding;
+    std::vector<B> bindings;
+    for (const uint32_t slot : { S::x, S::partial, S::frame_features, S::peak, S::labels }) {
+        bindings.push_back({ .set = 0,
+            .binding = slot,
+            .direction = B::Direction::OUTPUT,
+            .element_type = slot == S::peak ? B::ElementType::UINT32 : B::ElementType::FLOAT32 });
+    }
+
+    m_chain = std::make_shared<ShaderExecutionContext<>>(m_features_config, std::move(bindings), "vocalic_classify");
+    m_recorder = std::make_shared<GpuDispatchRecorder>(true);
+    m_chain->set_recording(m_recorder);
+    return true;
+}
+
+bool VocalicAnalyzer::run_gpu(std::span<const float> x, const VocalicConfig& cfg,
+    std::vector<Kinesis::Vocalic::Frame>& frames, std::vector<float>& labels)
+{
+    if (m_cpu_only || m_gpu_failed || x.empty() || !prepare_gpu()) {
+        return false;
+    }
+
     try {
-        const auto count = Kinesis::Vocalic::frame_count(x.size(), cfg.hop);
+        namespace S = VocalicShaders::Slot;
+        using Element = GpuBufferBinding::ElementType;
+        constexpr auto usage = Portal::Graphics::BufferUsageHint::COMPUTE;
+
+        const auto n = static_cast<uint32_t>(x.size());
+        const uint32_t count = Kinesis::Vocalic::frame_count(x.size(), cfg.hop);
+        const uint32_t chunks = VocalicShaders::k_lag_chunks;
         const auto lag = [&](float hz) {
             return static_cast<uint32_t>(std::lround(static_cast<double>(cfg.sample_rate) / std::max(1.0F, hz)));
         };
 
-        const uint32_t chunks = VocalicShaders::k_lag_chunks;
-        m_features->set_binding_data(0, x);
-        m_features->set_output_size(1, static_cast<size_t>(count) * chunks * 4 * sizeof(float));
-        m_features->push(FeaturePush { static_cast<uint32_t>(x.size()), cfg.frame, cfg.hop, count, lag(cfg.max_hz), lag(cfg.min_hz), chunks });
-        const auto fout = m_features->execute(input_type {}, ExecutionContext {});
-        const auto raw = ShaderExecutionContext<>::read_output<float>(fout, 1);
-        if (raw.size() < static_cast<size_t>(count) * chunks * 4) {
-            throw std::runtime_error("short feature readback");
-        }
+        auto& chain = *m_chain;
+        chain.ensure_shared_buffer(0, S::x, n, Element::FLOAT32, usage);
+        chain.ensure_shared_buffer(0, S::partial, static_cast<size_t>(count) * chunks * 4, Element::FLOAT32, usage);
+        chain.ensure_shared_buffer(0, S::frame_features, static_cast<size_t>(count) * 4, Element::FLOAT32, usage);
+        chain.ensure_shared_buffer(0, S::peak, 1, Element::UINT32, usage);
+        chain.ensure_shared_buffer(0, S::labels, count, Element::FLOAT32, usage);
 
-        // Each frame's lag search came back in chunks; keep the best.
-        frames.resize(count);
-        std::vector<float> reduced(static_cast<size_t>(count) * 4, 0.F);
-        for (uint32_t f = 0; f < count; ++f) {
-            const float* row = raw.data() + static_cast<size_t>(f) * chunks * 4;
-            float best = 0.F;
-            for (uint32_t c = 0; c < chunks; ++c) {
-                best = std::max(best, row[c * 4 + 2]);
-            }
-            frames[f] = { row[0], row[1], best };
-            reduced[f * 4] = row[0];
-            reduced[f * 4 + 1] = row[1];
-            reduced[f * 4 + 2] = best;
-        }
+        chain.upload_shared_raw(0, S::x, reinterpret_cast<const uint8_t*>(x.data()), x.size_bytes());
+        // The loudest frame starts at the reference, so a short window of a stream is judged against it.
+        chain.fill_shared(0, S::peak, std::bit_cast<uint32_t>(std::max(0.F, cfg.reference_rms)));
 
-        // The loudest frame is a reduction over all frames; it is cheap here.
-        const float vowel_rms = cfg.vowel_floor * Kinesis::Vocalic::loudest(frames);
+        const FeaturePush feature_push { n, cfg.frame, cfg.hop, count, lag(cfg.max_hz), lag(cfg.min_hz), chunks };
+        const ReducePush reduce_push { count, chunks };
+        const LabelPush label_push { count, cfg.smooth, cfg.silence, cfg.voicing, cfg.zcr_max, cfg.vowel_floor };
 
-        m_labels->set_binding_data(0, reduced);
-        m_labels->set_output_size(1, count * sizeof(float));
-        m_labels->push(LabelPush { count, cfg.smooth, cfg.silence, cfg.voicing, cfg.zcr_max, vowel_rms });
-        const auto lout = m_labels->execute(input_type {}, ExecutionContext {});
-        labels = ShaderExecutionContext<>::read_output<float>(lout, 1);
+        chain.record_stages({
+            { .config = m_features_config,
+                .stage_fn = [feature_push](GpuDispatchCore& c) { c.set_push_constants(feature_push); },
+                .explicit_groups = groups_for(static_cast<size_t>(count) * chunks) },
+            { .config = m_reduce_config,
+                .stage_fn = [reduce_push](GpuDispatchCore& c) { c.set_push_constants(reduce_push); },
+                .explicit_groups = groups_for(count) },
+            { .config = m_labels_config,
+                .stage_fn = [label_push](GpuDispatchCore& c) { c.set_push_constants(label_push); },
+                .explicit_groups = groups_for(count) },
+        });
+
+        // The first read submits the three stages and waits for them.
+        std::vector<float> per_frame(static_cast<size_t>(count) * 4);
+        chain.download_shared(0, S::frame_features, per_frame.data(), per_frame.size() * sizeof(float));
         labels.resize(count);
+        chain.download_shared(0, S::labels, labels.data(), labels.size() * sizeof(float));
+
+        frames.resize(count);
+        for (uint32_t f = 0; f < count; ++f) {
+            frames[f] = { per_frame[f * 4], per_frame[f * 4 + 1], per_frame[f * 4 + 2] };
+        }
         return true;
     } catch (const std::exception& e) {
         MF_WARN(Journal::Component::Yantra, Journal::Context::Runtime,

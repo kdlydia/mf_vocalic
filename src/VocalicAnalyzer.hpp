@@ -8,6 +8,8 @@
 
 namespace MayaFlux::Yantra {
 
+class GpuDispatchRecorder;
+
 /**
  * @brief Labels each frame of a voice as silence, vowel or consonant.
  *
@@ -23,9 +25,11 @@ namespace MayaFlux::Yantra {
  * whether the shaders ran.
  *
  * A vowel frame is loud, periodic and has few zero crossings. Consonants are
- * the rest that is not silent. Two compute shaders do the work: one for the
- * frame features, one for the labels and their majority vote. Without a GPU
- * the same arithmetic runs on the CPU (Kinesis::Vocalic).
+ * the rest that is not silent. Three compute kernels do the work, recorded
+ * into one submission over shared buffers: frame features, a reduce that
+ * finds each frame's best periodicity and the loudest frame, and the labels
+ * with their majority vote. Only the per-frame results are read back. Without
+ * a GPU the same arithmetic runs on the CPU (Kinesis::Vocalic).
  */
 class VocalicAnalyzer : public Analyzer<std::vector<Kakshya::DataVariant>> {
 public:
@@ -46,11 +50,15 @@ protected:
     bool validate_analysis_input(const input_type& input) const override;
 
 private:
+    bool prepare_gpu();
     bool run_gpu(std::span<const float> x, const VocalicConfig& cfg,
         std::vector<Kinesis::Vocalic::Frame>& frames, std::vector<float>& labels);
 
-    std::shared_ptr<ShaderExecutionContext<>> m_features;
-    std::shared_ptr<ShaderExecutionContext<>> m_labels;
+    std::shared_ptr<ShaderExecutionContext<>> m_chain;
+    std::shared_ptr<GpuDispatchRecorder> m_recorder;
+    GpuComputeConfig m_features_config;
+    GpuComputeConfig m_reduce_config;
+    GpuComputeConfig m_labels_config;
     bool m_cpu_only { false };
     bool m_gpu_failed { false };
 };
